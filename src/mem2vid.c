@@ -1,195 +1,244 @@
 #include <mem2vid/mem2vid.h>
 
-const uint32_t FRAMES_PER_SECOND = 25; // todo put in configuration parameters
+/**
+ * receive packets and write to file
+ * is called after sending frame or after all frames have been sent */
+static int flush_packets(video_t *p_video);
 
-/** encode a single frame */
-// todo decompose the functionality of this method?
-static int encode(video_t *p_video)
+int video_start(video_t *video, const char *name, video_param_t param)
 {
     int ret;
 
-    // send the frame to the encoder
-    if (p_video->frame) {
-        printf("Send frame %3"PRId64"\n", p_video->frame->pts);
+    /** append the filename with .mp4 */
+    uint32_t len = strlen(name);
+    const char ext[] = ".mp4";
+    char *filename = calloc(sizeof(ext) + len, sizeof(char));
+    strcat(filename, name);
+    strcat(filename, ext); // ext is null-terminated
+
+    /** add video stream using default format codec, and initialize the codec */
+    // allocate output format (use format_name to find mp4)
+    avformat_alloc_output_context2(&video->output_context, NULL, "mp4", NULL);
+    if (!video->output_context) {
+        fprintf(stderr, "Could not allocate output format\n");
+        goto cleanup_name;
     }
 
-    ret = avcodec_send_frame(p_video->enc_ctx, p_video->frame);
-    if (ret < 0) {
-        fprintf(stderr, "Error sending a frame for encoding\n");
-        return EXIT_FAILURE;
+    video->format = video->output_context->oformat;
+
+    // find video encoder
+    video->codec = avcodec_find_encoder(video->format->video_codec);
+    if (!video->codec) {
+        fprintf(stderr, "Could not find encoder\n");
+        goto cleanup_name_context;
     }
 
-    while (ret >= 0) {
-        ret = avcodec_receive_packet(p_video->enc_ctx, p_video->pkt);
-        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-            return EXIT_SUCCESS;
-        else if (ret < 0) {
-            fprintf(stderr, "Error during encoding\n");
-            return EXIT_FAILURE;
-        }
-
-        printf("Write packet %3"PRId64" (size=%5d)\n", p_video->pkt->pts, p_video->pkt->size);
-        fwrite(p_video->pkt->data, 1, p_video->pkt->size, p_video->outfile);
-        av_packet_unref(p_video->pkt);
+    // create stream
+    video->stream = avformat_new_stream(video->output_context, NULL);
+    if (!video->stream) {
+        fprintf(stderr, "Could not create stream\n");
+        goto cleanup_name_context;
     }
-
-    return EXIT_SUCCESS;
-}
-
-int video_start(video_t *p_video, const char *p_filename)
-{
-    const AVCodec *codec;
-
-    /** perform initialization */
-    // find the mpeg1video encoder
-    codec = avcodec_find_encoder(AV_CODEC_ID_MPEG1VIDEO);
-    if (!codec) {
-        fprintf(stderr, "mpeg1video encoder not found\n");
-        goto cleanup_none;
-    }
+    video->stream->id = (int) (video->output_context->nb_streams - 1);
 
     // allocate video codec context
-    p_video->enc_ctx = avcodec_alloc_context3(codec);
-    if (!p_video->enc_ctx) {
+    video->enc = avcodec_alloc_context3(video->codec);
+    if (!video->enc) {
         fprintf(stderr, "Could not allocate video codec context\n");
-        goto cleanup_none;
+        goto cleanup_name_context_stream;
     }
 
-    // allocate packet
-    p_video->pkt = av_packet_alloc();
-    if (!p_video->pkt) {
-        fprintf(stderr, "Could not allocate packet\n");
-        goto cleanup_context;
+    video->enc->codec_id = video->format->video_codec;
+    video->enc->bit_rate = 400000;
+    video->enc->width = param.width;
+    video->enc->height = param.height;
+    video->stream->time_base = (AVRational) {.num=1, .den=param.frames_per_second};
+    video->enc->time_base = video->stream->time_base;
+    video->enc->gop_size = 12; /* emit one intra frame every twelve frames at most */
+    video->enc->pix_fmt = AV_PIX_FMT_YUV420P;
+    if (video->enc->codec_id == AV_CODEC_ID_MPEG2VIDEO) {
+        /* just for testing, we also add B-frames */
+        video->enc->max_b_frames = 2;
+    }
+    if (video->enc->codec_id == AV_CODEC_ID_MPEG1VIDEO) {
+        /* Needed to avoid using macroblocks in which some coeffs overflow.
+         * This does not happen with normal video, it just happens here as
+         * the motion of the chroma plane does not match the luma plane. */
+        video->enc->mb_decision = 2;
     }
 
-    // todo these options should go in some type of parameters
-    // put sample parameters
-    p_video->enc_ctx->bit_rate = 400000;
-    // resolution must be a multiple of two
-    p_video->enc_ctx->width = 352;
-    p_video->enc_ctx->height = 288;
-    // frames per second
-    p_video->enc_ctx->time_base = (AVRational) {1, FRAMES_PER_SECOND};
-    p_video->enc_ctx->framerate = (AVRational) {FRAMES_PER_SECOND, 1};
-    /* emit one intra frame every ten frames
-     * check frame pict_type before passing frame
-     * to encoder, if frame->pict_type is AV_PICTURE_TYPE_I
-     * then gop_size is ignored and the output of encoder
-     * will always be I frame irrespective to gop_size
-     */
-    p_video->enc_ctx->gop_size = 10;
-    p_video->enc_ctx->max_b_frames = 1;
-    p_video->enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-
-    if (codec->id == AV_CODEC_ID_H264) {
-        av_opt_set(p_video->enc_ctx->priv_data, "preset", "slow", 0);
+    /* Some formats want stream headers to be separate. */
+    if (video->output_context->oformat->flags & AVFMT_GLOBALHEADER) {
+        video->enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
 
-    // open it
-    int ret = avcodec_open2(p_video->enc_ctx, codec, NULL);
-    if (ret < 0) {
+    /** open video codec and allocate necessary encode buffers */
+    ret = avcodec_open2(video->enc, video->codec, NULL);
+    if (ret != 0) {
         fprintf(stderr, "Could not open codec: %s\n", av_err2str(ret));
-        goto cleanup_context_packet;
-    }
-
-    // open file
-    p_video->outfile = fopen(p_filename, "wb");
-    if (!p_video->outfile) {
-        fprintf(stderr, "Could not open %s\n", p_filename);
-        goto cleanup_context_packet;
+        goto cleanup_name_context_stream_context;
     }
 
     // allocate video frame
-    p_video->frame = av_frame_alloc();
-    if (!p_video->frame) {
+    video->frame = av_frame_alloc();
+    if (!video->frame) {
         fprintf(stderr, "Could not allocate video frame\n");
-        goto cleanup_context_packet_file;
+        goto cleanup_name_context_stream_context;
     }
+    video->frame->format = video->enc->pix_fmt;
+    video->frame->width = video->enc->width;
+    video->frame->height = video->enc->height;
 
-    p_video->frame->format = p_video->enc_ctx->pix_fmt;
-    p_video->frame->width = p_video->enc_ctx->width;
-    p_video->frame->height = p_video->enc_ctx->height;
-
-    ret = av_frame_get_buffer(p_video->frame, 32);
+    // allocate the buffers for the frame data
+    ret = av_frame_get_buffer(video->frame, 32);
     if (ret < 0) {
         fprintf(stderr, "Could not allocate the video frame data\n");
+        goto cleanup_name_context_stream_context_frame;
+    }
+
+    // copy the stream parameters to the muxer
+    ret = avcodec_parameters_from_context(video->stream->codecpar, video->enc);
+    if (ret < 0) {
+        fprintf(stderr, "Could not copy the stream parameters\n");
+        goto cleanup_name_context_stream_context_frame;
+    }
+
+    // print some info
+    av_dump_format(video->output_context, 0, filename, 1);
+
+    /** open output file */
+    // NB: skip checking AVFMT_NOFILE flag, we always want a file
+    ret = avio_open(&video->output_context->pb, filename, AVIO_FLAG_WRITE);
+    if (ret != 0) {
+        fprintf(stderr, "Could not open %s\n", filename);
+        goto cleanup_name_context_stream_context_frame;
+    }
+
+    /** write stream header */
+    // write the stream header, if any
+    ret = avformat_write_header(video->output_context, NULL);
+    if (ret < 0) {
+        fprintf(stderr, "Could not write \n");
         goto cleanup_all;
     }
 
-    p_video->frame_index = 0;
+    /** misc initialization */
+    video->frame_index = 0;
+
+    free(filename);
 
     return EXIT_SUCCESS;
 
     /** cleanup in case initialization fails */
     // NB: duplicate tail as {video_finish}
     cleanup_all:
+    // close output file
+    ret = avio_close(video->output_context->pb);
+    if (ret != 0) {
+        fprintf(stderr, "Failed to close file\n");
+    }
+    cleanup_name_context_stream_context_frame:
     // free frame
-    av_frame_free(&p_video->frame);
-
-    cleanup_context_packet_file:
-    // close file
-    fclose(p_video->outfile);
-
-    cleanup_context_packet:
-    // free packet
-    av_packet_free(&p_video->pkt);
-
-    cleanup_context:
+    av_frame_free(&video->frame);
+    cleanup_name_context_stream_context:
     // free context
-    avcodec_free_context(&p_video->enc_ctx);
+    avcodec_free_context(&video->enc);
+    cleanup_name_context_stream:
+    // close stream
+    avcodec_close(video->enc);
+    cleanup_name_context:
+    // cleanup context
+    avformat_free_context(video->output_context);
+    cleanup_name:
+    // free filename
+    free(filename);
 
-    cleanup_none:
     return EXIT_SUCCESS;
 }
 
-void video_finish(video_t *p_video)
+void video_finish(video_t *video)
 {
-    // MPEG file sequence end code
-    // todo how is this handled in the case of other codecs?
-    const uint8_t endcode[] = {0, 0, 1, 0xb7};
+    int ret;
+    /** flush out encoder to receive delayed frames */
+    // indicate that no more frames will be sent
+    avcodec_send_frame(video->enc, NULL);
+    flush_packets(video);
 
-    // flush the encoder
-    p_video->frame = NULL;
-    encode(p_video);
+    /** write stream trailer */
+    av_write_trailer(video->output_context);
 
-    // add sequence end code to have a real MPEG file
-    fwrite(endcode, 1, sizeof(endcode), p_video->outfile);
-
+    /** perform cleanup, in order of allocation */
     // NB: duplicate tail as {video_start}
-    // free frame
-    av_frame_free(&p_video->frame);
+    ret = avio_close(video->output_context->pb);
+    if (ret != 0) {
+        fprintf(stderr, "Failed to close file\n");
+    }
 
-    // close file
-    fclose(p_video->outfile);
-
-    // free packet
-    av_packet_free(&p_video->pkt);
-
-    // free context
-    avcodec_free_context(&p_video->enc_ctx);
+    av_frame_free(&video->frame);
+    avcodec_free_context(&video->enc);
+    avcodec_close(video->enc);
+    avformat_free_context(video->output_context);
 }
 
-int video_submit(video_t *p_video, const uint8_t *Y, const uint8_t *Cb, const uint8_t *Cr)
+int video_submit(video_t *video, const uint8_t *Y, const uint8_t *Cb, const uint8_t *Cr)
 {
     int ret;
 
     /** prepare the frame */
-    fflush(stdout);
-
     // make sure the frame data is writable
-    ret = av_frame_make_writable(p_video->frame);
+    ret = av_frame_make_writable(video->frame);
     if (ret < 0) {
         return EXIT_FAILURE;
     }
 
     // todo figure out the format and size of this data
     // copy data: first all Y, then all Cb, then all Cr
-    memcpy(p_video->frame->data[0], Y, p_video->frame->linesize[0] * p_video->enc_ctx->height);
-    memcpy(p_video->frame->data[1], Cb, p_video->frame->linesize[1] * (p_video->enc_ctx->height / 2));
-    memcpy(p_video->frame->data[2], Cr, p_video->frame->linesize[2] * (p_video->enc_ctx->height / 2));
+    memcpy(video->frame->data[0], Y, video->frame->linesize[0] * video->enc->height);
+    memcpy(video->frame->data[1], Cb, video->frame->linesize[1] * (video->enc->height / 2));
+    memcpy(video->frame->data[2], Cr, video->frame->linesize[2] * (video->enc->height / 2));
 
-    p_video->frame->pts = p_video->frame_index++;
+    video->frame->pts = video->frame_index++;
 
     /** encode the image */
-    return encode(p_video);
+    // send the frame to the encoder
+    ret = avcodec_send_frame(video->enc, video->frame);
+    if (ret < 0) {
+        fprintf(stderr, "Error sending a frame for encoding\n");
+        return EXIT_FAILURE;
+    }
+
+    // write received frames
+    return flush_packets(video);
+}
+
+static int flush_packets(video_t *p_video)
+{
+    int ret;
+    do {
+        AVPacket pkt = {0};
+
+        ret = avcodec_receive_packet(p_video->enc, &pkt);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            break;
+        } else if (ret < 0) {
+            fprintf(stderr, "Error encoding a frame: %s\n", av_err2str(ret));
+
+            return EXIT_FAILURE;
+        }
+
+        // rescale output packet timestamp values from codec to stream timebase
+        av_packet_rescale_ts(&pkt, p_video->enc->time_base, p_video->stream->time_base);
+        pkt.stream_index = p_video->stream->index;
+
+        // write the compressed frame to the media file
+        ret = av_interleaved_write_frame(p_video->output_context, &pkt);
+        av_packet_unref(&pkt);
+        if (ret < 0) {
+            fprintf(stderr, "Error while writing output packet: %s\n", av_err2str(ret));
+
+            return EXIT_FAILURE;
+        }
+    } while (ret >= 0);
+
+    return EXIT_SUCCESS;
 }

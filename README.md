@@ -13,3 +13,6 @@ The following steps describe how to build this project with the MinGW-w64 compil
  linking type development (`dev`).
 - Extract and place contents into `external/ffmpeg-4.2.2`.
 - Build the library with CMake.
+
+### 
+See [here](https://ffmpeg.org/doxygen/4.1/examples.html) for the examples followed in creating the library.
