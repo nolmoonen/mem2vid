@@ -2,21 +2,9 @@
 #define MEM2VID_MEM2VID_H
 
 #include <stdio.h>
-
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libswscale/swscale.h>
-
-typedef struct {
-    AVFormatContext *output_context;
-    AVStream *stream;
-    AVCodecContext *enc;
-    AVFrame *frame;
-    struct SwsContext *sws_context;
-    AVCodec *codec;
-    /** index of the next frame */
-    uint32_t frame_index;
-} video_t;
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
 
 typedef struct {
     /** size of the video in pixels */
@@ -32,12 +20,12 @@ typedef struct {
 /**
  * {name} is the name of the file, not including extension (will always be .mp4)
  * if EXIT_SUCCESS is returned, a call to {video_finish} is required */
-int video_start(video_t *video, const char *name, video_param_t param);
+int video_start(const char *name, video_param_t param);
 
 /** finalizes the video creation */
-void video_finish(video_t *video);
+void video_finish();
 
 /** data format is rgbrgbrgbrgbrgb */
-int video_submit(video_t *video, const uint8_t *rgb);
+int video_submit(const uint8_t *rgb);
 
 #endif //MEM2VID_MEM2VID_H

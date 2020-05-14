@@ -6,9 +6,8 @@ int main(void)
     const uint32_t WIDTH = 1280;
     const uint32_t HEIGHT = 720;
 
-    video_t video; // handle to initialize, cleanup, and push frames to video
     video_param_t params = {.size_x=WIDTH, .size_y=HEIGHT, .frames_per_second=FRAMES_PER_SECOND, .bitrate=20};
-    int ret = video_start(&video, "example", params); // initialize video with chosen parameters
+    int ret = video_start("example", params); // initialize video with chosen parameters
     if (ret != EXIT_SUCCESS) {
         fprintf(stderr, "failed to initialize video\n");
 
@@ -27,10 +26,10 @@ int main(void)
             }
         }
 
-        video_submit(&video, rgb); // push the frame to the video
+        video_submit(rgb); // push the frame to the video
     }
 
-    video_finish(&video); // finalize the video creation, perform cleanup
+    video_finish(); // finalize the video creation, perform cleanup
     free(rgb);
 
     return EXIT_SUCCESS;

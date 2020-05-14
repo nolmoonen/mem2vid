@@ -1,13 +1,36 @@
 #include <mem2vid/mem2vid.h>
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libswscale/swscale.h>
+
+typedef struct {
+    AVFormatContext *output_context;
+    AVStream *stream;
+    AVCodecContext *enc;
+    AVFrame *frame;
+    struct SwsContext *sws_context;
+    AVCodec *codec;
+/** index of the next frame */
+    uint32_t frame_index;
+} video_t;
+
+/** for simplicity, allow only for one active video at a time */
+static bool m_initialized = false;
+static video_t m_video;
 
 /**
  * receive packets and write to file
  * is called after sending frame or after all frames have been sent */
 static int flush_packets(video_t *p_video);
 
-int video_start(video_t *video, const char *name, video_param_t param)
+int video_start(const char *name, video_param_t param)
 {
     int ret;
+    if (m_initialized) {
+        fprintf(stderr, "video already started\n");
+        goto cleanup_none;
+    }
+    video_t *video = &m_video;
 
     // set all data to default
     video_t empty = {0};
@@ -131,6 +154,7 @@ int video_start(video_t *video, const char *name, video_param_t param)
     video->frame_index = 0;
 
     free(filename);
+    m_initialized = true;
 
     return EXIT_SUCCESS;
 
@@ -160,13 +184,20 @@ int video_start(video_t *video, const char *name, video_param_t param)
     cleanup_name:
     // free filename
     free(filename);
+    cleanup_none:
 
     return EXIT_SUCCESS;
 }
 
-void video_finish(video_t *video)
+void video_finish()
 {
     int ret;
+    if (!m_initialized) {
+        fprintf(stderr, "video is not started\n");
+        return;
+    }
+    video_t *video = &m_video;
+
     /** flush out encoder to receive delayed frames */
     // indicate that no more frames will be sent
     avcodec_send_frame(video->enc, NULL);
@@ -186,16 +217,24 @@ void video_finish(video_t *video)
     avcodec_free_context(&video->enc);
     avcodec_close(video->enc);
     avformat_free_context(video->output_context);
+
+    m_initialized = false;
 }
 
-int video_submit(video_t *video, const uint8_t *rgb)
+int video_submit(const uint8_t *rgb)
 {
     int ret;
+    if (!m_initialized) {
+        fprintf(stderr, "video is not started\n");
+        return EXIT_FAILURE;
+    }
+    video_t *video = &m_video;
 
     /** prepare the frame */
     // make sure the frame data is writable
     ret = av_frame_make_writable(video->frame);
     if (ret < 0) {
+        fprintf(stderr, "frame not writable\n");
         return EXIT_FAILURE;
     }
 
