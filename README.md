@@ -14,7 +14,7 @@ The following steps describe how to use this library with the MinGW-w64 compiler
 
 ### Building
 The following steps describe how to build this project with the MinGW-w64 compiler.
-- Download FFmpeg import libraries and header [here](https://ffmpeg.zeranoe.com/builds/). Choose version 4.2.2, 
+- Download FFmpeg import libraries and headers [here](https://ffmpeg.zeranoe.com/builds/). Choose version 4.2.2, 
  linking type development (`dev`).
 - Extract and place contents into `external/ffmpeg-4.2.2-dev`.
 - Download FFmpeg shared libraries [here](https://ffmpeg.zeranoe.com/builds/). Choose version 4.2.2, 
